@@ -1,45 +1,42 @@
 name: Setup Branch Protection & Naming Rules
-
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write          # commit the branch-name check workflow
-  pull-requests: write
-
+# permissions block not needed since we use PAT for everything
 jobs:
   protect-and-configure:
     runs-on: ubuntu-latest
-
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name }}
+      ADMIN_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
     steps:
-      - name: Get repo coordinates
-        id: coords
+      - name: Verify admin token present
         run: |
-          REPO="${GITHUB_REPOSITORY##*/}"
-          OWNER="${GITHUB_REPOSITORY%/*}"
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "owner=$OWNER" >> $GITHUB_OUTPUT
+          if [ -z "${ADMIN_TOKEN}" ]; then
+            echo "Missing REPO_ADMIN_TOKEN secret with Administration & Contents: Read/Write." >&2
+            exit 1
+          fi
 
-      - name: Get repository ID (GraphQL)
+      - name: Get repository ID (GraphQL via PAT)
         id: repo
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.ADMIN_TOKEN }}
           script: |
-            const q = `
-              query($owner:String!, $name:String!){
-                repository(owner:$owner, name:$name){ id }
-              }
-            `;
+            const q = `query($owner:String!, $name:String!){
+              repository(owner:$owner, name:$name){ id }
+            }`;
             const res = await github.graphql(q, {
-              owner: process.env.GITHUB_REPOSITORY.split('/')[0],
-              name:  process.env.GITHUB_REPOSITORY.split('/')[1],
+              owner: process.env.OWNER,
+              name:  process.env.REPO,
             });
             core.setOutput('id', res.repository.id);
 
-      # ---- Branch protection: main ----
-      - name: Protect main with PR rules (GraphQL)
+      - name: Protect main (GraphQL via PAT)
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.ADMIN_TOKEN }}
           script: |
             const mutation = `
               mutation($repositoryId: ID!) {
@@ -61,14 +58,13 @@ jobs:
                   allowsForcePushes: false
                   allowsDeletions: false
                 }) { branchProtectionRule { id } }
-              }
-            `;
+              }`;
             await github.graphql(mutation, { repositoryId: '${{ steps.repo.outputs.id }}' });
 
-      # ---- Branch protection: release/* pattern ----
-      - name: Protect release/* with PR rules (GraphQL)
+      - name: Protect release/* (GraphQL via PAT)
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.ADMIN_TOKEN }}
           script: |
             const mutation = `
               mutation($repositoryId: ID!) {
@@ -90,26 +86,23 @@ jobs:
                   allowsForcePushes: false
                   allowsDeletions: false
                 }) { branchProtectionRule { id } }
-              }
-            `;
+              }`;
             await github.graphql(mutation, { repositoryId: '${{ steps.repo.outputs.id }}' });
 
-      # ---- Optional: protect release tags like v* from being moved ----
-      - name: Protect release tags v*
+      - name: Protect release tags v* (REST via PAT)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ env.ADMIN_TOKEN }}
         run: |
-          OWNER="${{ steps.coords.outputs.owner }}"
-          REPO="${{ steps.coords.outputs.repo }}"
-          gh api \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
+          gh api -X POST -H "Accept: application/vnd.github+json" \
             "/repos/$OWNER/$REPO/tags/protection" \
             -f pattern='v*' || true
 
-      # ---- Commit a lightweight branch-name enforcement workflow ----
-      - name: Write branch-name check workflow
+      - name: Commit branch-name check workflow (using PAT)
+        env:
+          GH_EMAIL: actions@users.noreply.github.com
+          GH_NAME: github-actions
         run: |
+          set -e
           mkdir -p .github/workflows
           cat > .github/workflows/branch-name-check.yml <<'WF'
           name: Branch name check
@@ -126,8 +119,6 @@ jobs:
                 - name: Validate branch name
                   run: |
                     BRANCH="${GITHUB_REF_NAME}"
-                    # Allowed prefixes: feat, fix, hotfix, chore, refactor, docs, test, perf, build, ci, revert
-                    # Format: <type>/<kebab-or-snake-or-dotted>
                     PATTERN='^(feat|fix|hotfix|chore|refactor|docs|test|perf|build|ci|revert)\/[a-z0-9._-]+$'
                     if [[ "$BRANCH" =~ ^(main|release\/.+)$ ]]; then
                       echo "Skipping enforcement for $BRANCH"
@@ -136,34 +127,18 @@ jobs:
                     if [[ "$BRANCH" =~ $PATTERN ]]; then
                       echo "Branch name OK: $BRANCH"
                     else
-                      echo "❌ Branch name '$BRANCH' does not match:
-                      $PATTERN
-
-                      Examples:
-                        feat/add-login
-                        fix/null-pointer
-                        hotfix/rollback-v123
-                        docs/readme-update
-                      " >&2
+                      echo "❌ Branch name '$BRANCH' does not match $PATTERN" >&2
                       exit 1
                     fi
           WF
 
-      - name: Commit branch-name check workflow
-        env:
-          GH_EMAIL: actions@users.noreply.github.com
-          GH_NAME: github-actions
-        run: |
-          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-            git init
-            git checkout -b temp-setup
-          fi
+          git init
+          git checkout -b temp-setup
           git config user.email "$GH_EMAIL"
           git config user.name "$GH_NAME"
           git add .github/workflows/branch-name-check.yml
-          git commit -m "chore: add branch name enforcement workflow"
-          # Use the repo's default branch, usually 'main'
-          DEFAULT_BRANCH="${GITHUB_REF_NAME:-main}"
-          git branch -M "$DEFAULT_BRANCH" || true
-          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" || true
-          git push -u origin "$DEFAULT_BRANCH"
+          git commit -m "chore: add branch name enforcement workflow" || echo "No changes"
+          # push via PAT
+          git remote add origin "https://${OWNER}:${ADMIN_TOKEN}@github.com/${OWNER}/${REPO}.git"
+          # push to main; create it if it doesn't exist yet
+          git push -u origin HEAD:main || true
