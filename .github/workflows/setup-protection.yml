@@ -1,8 +1,8 @@
-name: Setup Branch Protection & Naming Rules
+name: Setup Branch Protection, Rules & Naming (PAT)
+
 on:
   workflow_dispatch:
 
-# permissions block not needed since we use PAT for everything
 jobs:
   protect-and-configure:
     runs-on: ubuntu-latest
@@ -10,86 +10,79 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       REPO: ${{ github.event.repository.name }}
       ADMIN_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+
     steps:
-      - name: Verify admin token present
+      - name: Preflight — verify PAT & repo access
+        env:
+          GH_TOKEN: ${{ env.ADMIN_TOKEN }}
         run: |
-          if [ -z "${ADMIN_TOKEN}" ]; then
-            echo "Missing REPO_ADMIN_TOKEN secret with Administration & Contents: Read/Write." >&2
-            exit 1
-          fi
+          test -n "$GH_TOKEN" || { echo "❌ Missing REPO_ADMIN_TOKEN secret"; exit 1; }
+          gh api /user >/dev/null || { echo "❌ PAT invalid/expired"; exit 1; }
+          gh api "/repos/$OWNER/$REPO" >/dev/null || {
+            echo "❌ PAT cannot access $OWNER/$REPO. Ensure the PAT's Resource owner is your org, repo is selected, and SSO is authorized."; exit 1; }
+          echo "✅ PAT can access $OWNER/$REPO"
 
-      - name: Get repository ID (GraphQL via PAT)
-        id: repo
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.ADMIN_TOKEN }}
-          script: |
-            const q = `query($owner:String!, $name:String!){
-              repository(owner:$owner, name:$name){ id }
-            }`;
-            const res = await github.graphql(q, {
-              owner: process.env.OWNER,
-              name:  process.env.REPO,
-            });
-            core.setOutput('id', res.repository.id);
+      # --- Protect the 'main' branch via REST (no GraphQL needed)
+      - name: Protect main (PRs, 2 reviews, CODEOWNERS, strict checks, signed commits)
+        env:
+          GH_TOKEN: ${{ env.ADMIN_TOKEN }}
+        run: |
+          gh api --method PUT -H "Accept: application/vnd.github+json" \
+            "/repos/$OWNER/$REPO/branches/main/protection" \
+            -f enforce_admins=true \
+            -f allow_force_pushes=false \
+            -f allow_deletions=false \
+            -f required_status_checks.strict=true \
+            -f required_status_checks.contexts[]="build" \
+            -f required_status_checks.contexts[]="unit-tests" \
+            -f required_status_checks.contexts[]="lint" \
+            -f required_status_checks.contexts[]="sast" \
+            -f required_status_checks.contexts[]="coverage" \
+            -F required_pull_request_reviews='{"dismiss_stale_reviews":true,"require_code_owner_reviews":true,"required_approving_review_count":2,"require_last_push_approval":false}' \
+            -F restrictions='null' \
+            -F required_signatures='true' || {
+              echo "ℹ️ Some orgs block 'required_signatures' via REST; if this fails, remove the last line and rerun."; true; }
 
-      - name: Protect main (GraphQL via PAT)
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.ADMIN_TOKEN }}
-          script: |
-            const mutation = `
-              mutation($repositoryId: ID!) {
-                createBranchProtectionRule(input:{
-                  repositoryId: $repositoryId
-                  pattern: "main"
-                  requiresApprovingReviews: true
-                  requiredApprovingReviewCount: 2
-                  dismissesStaleReviews: true
-                  requiresCodeOwnerReviews: true
-                  requiresStatusChecks: true
-                  requiresStrictStatusChecks: true
-                  requiredStatusCheckContexts: [
-                    "build","unit-tests","lint","sast","coverage"
-                  ]
-                  requiresConversationResolution: true
-                  requiresCommitSignatures: true
-                  isAdminEnforced: true
-                  allowsForcePushes: false
-                  allowsDeletions: false
-                }) { branchProtectionRule { id } }
-              }`;
-            await github.graphql(mutation, { repositoryId: '${{ steps.repo.outputs.id }}' });
+      # --- Create a Ruleset for release/* using REST (handles wildcards)
+      - name: Create ruleset for release/* (1 review, CODEOWNERS, strict checks, no fast-forward)
+        env:
+          GH_TOKEN: ${{ env.ADMIN_TOKEN }}
+        run: |
+          cat > ruleset.json <<'JSON'
+          {
+            "name": "release-branch-protection",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": { "include": ["release/*"], "exclude": [] }
+            },
+            "rules": [
+              {
+                "type": "pull_request",
+                "parameters": {
+                  "dismiss_stale_reviews_on_push": true,
+                  "require_code_owner_review": true,
+                  "required_approvals": 1,
+                  "required_review_thread_resolution": true
+                }
+              },
+              {
+                "type": "required_status_checks",
+                "parameters": {
+                  "strict_required_status_checks": true,
+                  "required_status_checks": ["build","unit-tests","lint","sast","coverage"]
+                }
+              },
+              { "type": "non_fast_forward" }
+            ]
+          }
+          JSON
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/$OWNER/$REPO/rulesets" --input ruleset.json
 
-      - name: Protect release/* (GraphQL via PAT)
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.ADMIN_TOKEN }}
-          script: |
-            const mutation = `
-              mutation($repositoryId: ID!) {
-                createBranchProtectionRule(input:{
-                  repositoryId: $repositoryId
-                  pattern: "release/*"
-                  requiresApprovingReviews: true
-                  requiredApprovingReviewCount: 1
-                  dismissesStaleReviews: true
-                  requiresCodeOwnerReviews: true
-                  requiresStatusChecks: true
-                  requiresStrictStatusChecks: true
-                  requiredStatusCheckContexts: [
-                    "build","unit-tests","lint","sast","coverage"
-                  ]
-                  requiresConversationResolution: true
-                  requiresCommitSignatures: true
-                  isAdminEnforced: true
-                  allowsForcePushes: false
-                  allowsDeletions: false
-                }) { branchProtectionRule { id } }
-              }`;
-            await github.graphql(mutation, { repositoryId: '${{ steps.repo.outputs.id }}' });
-
-      - name: Protect release tags v* (REST via PAT)
+      # --- Tag protection for v* (avoid moving release tags)
+      - name: Protect release tags v*
         env:
           GH_TOKEN: ${{ env.ADMIN_TOKEN }}
         run: |
@@ -97,12 +90,14 @@ jobs:
             "/repos/$OWNER/$REPO/tags/protection" \
             -f pattern='v*' || true
 
-      - name: Commit branch-name check workflow (using PAT)
-        env:
-          GH_EMAIL: actions@users.noreply.github.com
-          GH_NAME: github-actions
+      # --- Commit a small branch naming enforcement workflow
+      - name: Check out repo (use PAT to be able to push)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ env.ADMIN_TOKEN }}
+
+      - name: Add branch-name enforcement workflow
         run: |
-          set -e
           mkdir -p .github/workflows
           cat > .github/workflows/branch-name-check.yml <<'WF'
           name: Branch name check
@@ -119,26 +114,24 @@ jobs:
                 - name: Validate branch name
                   run: |
                     BRANCH="${GITHUB_REF_NAME}"
+                    # Allowed prefixes: feat, fix, hotfix, chore, refactor, docs, test, perf, build, ci, revert
                     PATTERN='^(feat|fix|hotfix|chore|refactor|docs|test|perf|build|ci|revert)\/[a-z0-9._-]+$'
                     if [[ "$BRANCH" =~ ^(main|release\/.+)$ ]]; then
-                      echo "Skipping enforcement for $BRANCH"
-                      exit 0
-                    fi
+                      echo "Skipping enforcement for $BRANCH"; exit 0; fi
                     if [[ "$BRANCH" =~ $PATTERN ]]; then
                       echo "Branch name OK: $BRANCH"
                     else
-                      echo "❌ Branch name '$BRANCH' does not match $PATTERN" >&2
+                      echo "❌ Branch name '$BRANCH' does not match: $PATTERN
+                      Examples:
+                        feat/add-login
+                        fix/null-pointer
+                        hotfix/rollback-v123
+                        docs/readme-update" >&2
                       exit 1
                     fi
           WF
-
-          git init
-          git checkout -b temp-setup
-          git config user.email "$GH_EMAIL"
-          git config user.name "$GH_NAME"
           git add .github/workflows/branch-name-check.yml
-          git commit -m "chore: add branch name enforcement workflow" || echo "No changes"
-          # push via PAT
-          git remote add origin "https://${OWNER}:${ADMIN_TOKEN}@github.com/${OWNER}/${REPO}.git"
-          # push to main; create it if it doesn't exist yet
-          git push -u origin HEAD:main || true
+          git -c user.name="github-actions" -c user.email="actions@users.noreply.github.com" \
+            commit -m "chore: add branch name enforcement workflow" || echo "No changes"
+          # Push to default branch (assumed 'main'); adjust if your default is different
+          git push origin HEAD:main
